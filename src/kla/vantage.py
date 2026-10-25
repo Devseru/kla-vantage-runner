@@ -1,9 +1,13 @@
 """A second vantage point: the same measurements from a GitHub-hosted runner.
 
 The laptop measures from Kenya. To separate network time from provider time, the
-same probes and AI calls also run hourly on a GitHub Actions runner in an Azure
-datacentre (.github/workflows/vantage.yml). From there the network part is small,
-so what remains is mostly the provider's own time.
+same probes and AI calls also run on a GitHub Actions runner in an Azure datacentre
+(.github/workflows/vantage.yml), four times an hour. From there the network part is
+small, so what remains is mostly the provider's own time.
+
+Every run probes the 9 LLM hosts. AI calls are made at most once per EAT hour per
+provider, by the first run that starts at or after :30 (the laptop's AI run is at
+:30); a later run that hour finds the calls on the vantage-data branch and skips them.
 
 Nothing here changes how the laptop measures. The runner calls the laptop's own
 functions (probe.probe_target, ai.call_model, ai.due, ai.assert_free) with the
@@ -37,7 +41,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +65,7 @@ CONTEXT_TABLE = """
     vantage_run_id TEXT PRIMARY KEY,
     vantage TEXT NOT NULL,              -- us-runner
     started_utc TEXT NOT NULL, started_eat TEXT NOT NULL, finished_utc TEXT NOT NULL,
-    slot_hour_eat INTEGER,              -- the scheduled :45 slot (GitHub often starts late)
+    slot_hour_eat INTEGER,              -- runs until 25 Oct 2026 only: the hourly :45 slot
     probe_run_id TEXT, ai_run_id TEXT,  -- this run's rows in `runs`
     runner_ip TEXT, asn INTEGER, as_name TEXT, asn_source TEXT,
     geo_city TEXT, geo_country TEXT, geo_source TEXT,
@@ -69,8 +73,12 @@ CONTEXT_TABLE = """
     azure_region TEXT, azure_vm_size TEXT, azure_error TEXT,
     event TEXT, gh_run_id TEXT, gh_run_attempt TEXT, git_sha TEXT, tool_version TEXT,
     runner_name TEXT, runner_os TEXT, image_os TEXT, image_version TEXT,
-    ai_notes TEXT                       -- why each provider was or was not called
+    ai_notes TEXT,                      -- why each provider was or was not called
+    ai_hour_eat INTEGER,                -- EAT hour of this run's AI calls; NULL before :30
+    gh_schedule TEXT                    -- the cron line that started the run; NULL if by hand
 """
+# Added after the first runs: connect_vantage_db adds them to an older data/vantage.sqlite3.
+ADDED_CONTEXT_COLUMNS = (("ai_hour_eat", "INTEGER"), ("gh_schedule", "TEXT"))
 # Tables copied into data/vantage.sqlite3 by `kla vantage pull`.
 PULLED = ("runs", "probes", "ai_calls")
 
@@ -82,7 +90,7 @@ class VantageError(RuntimeError):
 @dataclass(frozen=True)
 class Vantage:
     name: str
-    slot_minute: int
+    ai_from_minute: int  # AI calls only from this minute of the EAT hour
     odd_hours_only: tuple[str, ...]
     db_path: Path  # where `kla vantage pull` imports to
     repo_url: str | None = None  # the repo whose vantage-data branch holds the results
@@ -114,20 +122,22 @@ def load(cfg: Config, path: Path | None = None) -> tuple[Config, Vantage]:
     db_path = Path(str(v.get("db_path") or "data/vantage.sqlite3"))
     return Config(root=cfg.root, targets=targets, raw=raw), Vantage(
         name=str(v.get("name") or "us-runner"),
-        slot_minute=int(v.get("slot_minute", 45)),
+        ai_from_minute=int(v.get("ai_from_minute", 30)),
         odd_hours_only=tuple(v.get("odd_hours_only") or ()),
         db_path=db_path if db_path.is_absolute() else cfg.root / db_path,
         repo_url=str(v["repo_url"]) if v.get("repo_url") else None,
     )
 
 
-def slot_hour_eat(now: datetime, slot_minute: int) -> int:
-    """The EAT hour of the scheduled slot this run belongs to.
+def ai_hour_eat(now: datetime, from_minute: int) -> int | None:
+    """The EAT hour whose AI calls a run starting now may make; None before :from_minute.
 
-    GitHub often starts scheduled runs late: a run due at 21:45 that starts at
-    22:10 still belongs to hour 21.
+    The laptop's AI run starts at :30 (plus up to 5 min), so the runner's calls come
+    from the first run of the same hour that starts at or after :30, whatever its
+    scheduled time (GitHub often starts scheduled runs late).
     """
-    return util.to_eat(now - timedelta(minutes=slot_minute)).hour
+    eat = util.to_eat(now)
+    return eat.hour if eat.minute >= from_minute else None
 
 
 # ------------------------------------------------------------ runner context
@@ -201,6 +211,7 @@ def runner_context(root: Path = PROJECT_ROOT) -> tuple[dict[str, Any], context.P
         "runner_os": env("RUNNER_OS"),
         "image_os": env("ImageOS"),
         "image_version": env("ImageVersion"),
+        "gh_schedule": env("VANTAGE_SCHEDULE") or None,  # github.event.schedule (the workflow)
     }
     return row, pub
 
@@ -316,26 +327,39 @@ def _plan_ai(
     cfg: Config, v: Vantage, data_dir: Path, keys: dict[str, str], started: datetime
 ) -> tuple[list[ai.ModelChoice], list[str]]:
     """Which AI calls are due on this run, and a note per provider saying why (not)."""
+    hour = ai_hour_eat(started, v.ai_from_minute)
+    if hour is None:
+        return [], [f"all: probes only before :{v.ai_from_minute:02d} EAT"]
     try:
         hist = history(data_dir)
     except sqlite3.Error as exc:
         return [], [f"all: no AI calls, earlier runs could not be read ({exc})"]
     ledger_ok = (data_dir / LEDGER).exists()  # checked before anything could create it
-    slot = slot_hour_eat(started, v.slot_minute)
+    hour_start = util.to_eat(started).replace(minute=0, second=0, microsecond=0)
+    since = util.iso(hour_start.astimezone(UTC))
     plan: list[ai.ModelChoice] = []
     notes = []
     for name, pcfg in ai.providers(cfg).items():
         if not keys.get(str(pcfg.get("env_key"))):
             notes.append(f"{name}: no key")
             continue
-        if name in v.odd_hours_only and slot % 2 == 0:
+        if name in v.odd_hours_only and hour % 2 == 0:
             notes.append(f"{name}: odd EAT hours only")
+            continue
+        # Any call this hour counts, failed or not: at most one per provider per hour.
+        done = hist.execute(
+            "SELECT MIN(ts_utc) FROM ai_calls WHERE provider = ? AND ts_utc >= ?", (name, since)
+        ).fetchone()[0]
+        if done:
+            notes.append(f"{name}: already called this hour ({done})")
             continue
         if ai.is_paid(pcfg) and not ledger_ok:
             notes.append(f"{name}: REFUSED - no spend ledger at {LEDGER}")
             continue
         sizes = list(pcfg.get("scheduled") or ["small"])
-        ok, why = ai.due(hist, cfg, name, started, scheduled=True, needed=len(sizes))
+        # scheduled=False: the once-an-hour rule above replaces min_interval_minutes.
+        # due() still applies the 24 h budget, the 429 cool-down and the spend cap.
+        ok, why = ai.due(hist, cfg, name, started, scheduled=False, needed=len(sizes))
         if not ok:
             notes.append(f"{name}: not due ({why})")
             continue
@@ -427,7 +451,7 @@ def run(
                 "started_utc": util.iso(started),
                 "started_eat": util.iso(util.to_eat(started)),
                 "finished_utc": util.iso(finished),
-                "slot_hour_eat": slot_hour_eat(started, v.slot_minute),
+                "ai_hour_eat": ai_hour_eat(started, v.ai_from_minute),
                 "probe_run_id": probe_run_id,
                 "ai_run_id": ai_run_id,
                 "tool_version": __version__,
@@ -472,6 +496,10 @@ def connect_vantage_db(path: Path) -> sqlite3.Connection:
     for name, columns in tables.items():
         conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
         _append_only(conn, name)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(vantage_context)")}
+    for column, kind in ADDED_CONTEXT_COLUMNS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE vantage_context ADD COLUMN {column} {kind}")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS imported_files (path TEXT PRIMARY KEY, imported_utc TEXT)"
     )

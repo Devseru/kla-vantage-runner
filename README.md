@@ -448,7 +448,7 @@ switches on and off again within one run (20 s to a few minutes) is not caught.
 ### Comparison vantage point: a GitHub runner (added 25 Oct 2026)
 
 To separate network time from provider time, the same measurements also run
-hourly from a GitHub-hosted runner, a VM in an Azure datacentre
+four times an hour from a GitHub-hosted runner, a VM in an Azure datacentre
 (`.github/workflows/vantage.yml`, `src/kla/vantage.py`). From there the network
 part is small, so what remains is mostly the provider's own time.
 
@@ -459,11 +459,15 @@ part is small, so what remains is mostly the provider's own time.
   location from `cf-ray`) and `ai.call_model` for the AI calls (same models,
   prompt, streaming and one-clock first-token timing). `config/vantage.yaml` holds
   the few differences. No ping or `mtr`: GitHub runners block ICMP.
-- **When.** At :45 every hour (GitHub often starts a few minutes late), 10-15 min
-  after the laptop's AI run and alongside its :45 probe round. Groq and OpenAI
-  every hour; Gemini and OpenRouter every 2 h on odd EAT hours, because free
-  daily quotas belong to the API key and the runner uses the laptop's keys
-  (OpenRouter: 24 laptop + 12 runner calls of its 50 a day).
+- **When.** At :01, :16, :31 and :46, a minute after each of the laptop's 15-minute
+  probe rounds; GitHub starts scheduled runs late and drops some (on the first
+  night it ran 1 of 4), so four chances an hour keep the pairs coming. Every run
+  probes. AI calls are made at most once per EAT hour per provider, by the first
+  run that starts at or after :30, like the laptop's AI run at :30; later runs
+  that hour find the calls on `vantage-data` and skip them, and a failed call is
+  not retried that hour. Groq and OpenAI every hour; Gemini and OpenRouter on odd
+  EAT hours, because free daily quotas belong to the API key and the runner uses
+  the laptop's keys (OpenRouter: 24 laptop + 12 runner calls of its 50 a day).
 - **Where the runner was**, per run (`vantage_context`): its public IP (GitHub's
   Azure address, not the laptop's), ASN and city/country from RIPEstat, the
   Cloudflare location that answered it, and the Azure region and VM size from
@@ -479,7 +483,19 @@ part is small, so what remains is mostly the provider's own time.
   ledger, no paid call is made. The laptop's $1.00 cap is separate.
 - **Keys** come from GitHub Actions secrets, only in the measuring step.
 - **End date.** The first run after 31 Oct 2026 23:59 EAT switches the workflow
-  off without measuring. Until then about 165 runs, about 330 Actions minutes.
+  off without measuring. Each run takes under a minute; Actions minutes are free
+  for public repos on standard GitHub-hosted runners.
+- **Analysis plan.** The main laptop-vs-runner comparison is the **AI calls**:
+  first-word and total time per provider, a laptop call and a runner call paired
+  within the same EAT hour. The probe is supporting evidence only: its "server
+  wait" is the time to refuse a request sent without a key (`/models`, or `/key`
+  on OpenRouter; 401, or 403 from Gemini), not the time to run a model, and the
+  two can differ (from the laptop, Groq's real chat replies have started sooner
+  than its probe's server wait). Use the probe for where connecting costs time
+  (DNS, TCP, TLS) and where the connection is handled (Cloudflare location), with
+  each runner run paired to the nearest laptop round. The runner's Azure region
+  changes between runs (`vantage_context`), so results are reported per region or
+  the mix is stated, with `n` for every pair.
 
 ### Analysis
 

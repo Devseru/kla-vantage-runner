@@ -1,21 +1,26 @@
 name: vantage
 
-# The comparison vantage point: the laptop's own probes and AI calls, run hourly
-# from a GitHub-hosted runner (an Azure datacentre). Each run saves one SQLite
-# file to the vantage-data branch; `kla vantage pull` imports them on the laptop.
+# The comparison vantage point: the laptop's own probes and AI calls, run four
+# times an hour from a GitHub-hosted runner (an Azure datacentre). Each run saves
+# one SQLite file to the vantage-data branch; `kla vantage pull` imports them on
+# the laptop.
 
 on:
   schedule:
-    # :45 is 10-15 min after the laptop's AI run (:30 plus up to 5 min), and the
-    # same time as its :45 probe round. GitHub often starts these a few minutes late.
-    - cron: "45 * * * *"
+    # A minute after each of the laptop's 15-minute probe rounds (:00/:15/:30/:45
+    # plus up to 90 s), never :00, GitHub's busiest minute. GitHub starts scheduled
+    # runs late and drops some, so four chances an hour keep the laptop/runner
+    # pairs coming. Every run probes; AI calls are made once per hour, by the
+    # first run from :30 on (config/vantage.yaml, ai_from_minute).
+    - cron: "1,16,31,46 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write # push results to the vantage-data branch
   actions: write # let the workflow switch itself off after END_EAT
 
-# One run at a time: each run reads and writes the spend ledger.
+# One run at a time: each run reads the earlier runs' AI calls and writes the spend
+# ledger. (GitHub keeps one waiting run per group and cancels an older waiting one.)
 concurrency:
   group: vantage
   cancel-in-progress: false
@@ -67,6 +72,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VANTAGE_SCHEDULE: ${{ github.event.schedule }} # which cron line; empty if by hand
         run: .venv/bin/kla vantage run --data-dir vantage-data
 
       - name: Save to the vantage-data branch

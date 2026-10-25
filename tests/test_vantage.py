@@ -94,9 +94,13 @@ def test_runner_config_keeps_the_laptops_measurement_settings(cfg, tmp_path):
         assert ai.providers(vcfg)[name]["models"] == pcfg["models"]
     assert ai.providers(vcfg)["openai"]["spend_cap_usd"] == 0.25
     assert ai.providers(cfg)["openai"]["spend_cap_usd"] == 1.0  # the laptop's is untouched
-    assert (v.name, v.odd_hours_only) == ("us-runner", ("gemini", "openrouter"))
+    assert (v.name, v.odd_hours_only, v.ai_from_minute) == (
+        "us-runner",
+        ("gemini", "openrouter"),
+        30,
+    )
     assert v.db_path == cfg.root / "data" / "vantage.sqlite3" != cfg.db_path
-    assert v.repo_url == "https://github.com/Manu737-dot/kla-vantage.git"
+    assert v.repo_url == "https://github.com/Devseru/kla-vantage-runner.git"
     # Raising the cap in the override file has no effect: the code caps it at 0.25.
     raised = tmp_path / "vantage.yaml"
     raised.write_text(
@@ -105,12 +109,12 @@ def test_runner_config_keeps_the_laptops_measurement_settings(cfg, tmp_path):
     assert ai.providers(vantage.load(cfg, raised)[0])["openai"]["spend_cap_usd"] == 0.25
 
 
-def test_slot_hour_is_the_scheduled_hour_even_when_github_starts_late():
-    def slot(h, m):
-        return vantage.slot_hour_eat(datetime(2026, 10, 25, h, m, tzinfo=UTC), 45)
+def test_ai_hour_is_the_eat_hour_from_half_past_and_none_before():
+    def hour(h, m):
+        return vantage.ai_hour_eat(datetime(2026, 10, 25, h, m, tzinfo=UTC), 30)
 
-    # 18:46 UTC = 21:46 EAT; 19:30 UTC = 22:30 EAT (a late start of the 21:45 run)
-    assert (slot(18, 46), slot(19, 30), slot(19, 44), slot(19, 46)) == (21, 21, 21, 22)
+    # 18:29 UTC = 21:29 EAT, 18:30 = 21:30, 18:59 = 21:59, 19:01 = 22:01
+    assert (hour(18, 29), hour(18, 30), hour(18, 59), hour(19, 1)) == (None, 21, 21, None)
 
 
 def test_run_writes_one_file_with_the_laptop_tables_and_where_the_runner_was(runner, monkeypatch):
@@ -131,7 +135,8 @@ def test_run_writes_one_file_with_the_laptop_tables_and_where_the_runner_was(run
         RUNNER_IP,
         "eastus",
     )
-    assert ctx["slot_hour_eat"] == 21 and ctx["probe_run_id"] == runs[0]["run_id"]
+    assert ctx["ai_hour_eat"] == 21 and ctx["probe_run_id"] == runs[0]["run_id"]
+    assert ctx["slot_hour_eat"] is None
     [spend] = _rows(data / vantage.LEDGER, "SELECT * FROM ai_spend")
     assert spend["provider"] == "openai" and spend["recorded_in"] == path.name
     assert not _rows(path, "SELECT * FROM ai_spend")  # spend lives only in the ledger
@@ -139,20 +144,28 @@ def test_run_writes_one_file_with_the_laptop_tables_and_where_the_runner_was(run
     assert not vcfg.db_path.exists()  # the Kenya database is never created or touched
 
 
-def test_even_hours_skip_gemini_and_openrouter_and_history_spaces_the_calls(runner, monkeypatch):
+def test_every_run_probes_and_ai_calls_come_once_an_hour_from_half_past(runner, monkeypatch):
     vcfg, v, data, calls = runner
-    _at(monkeypatch, 19, 50)  # 22:50 EAT
+    _at(monkeypatch, 19, 50)  # 22:50 EAT: an even hour, so no Gemini or OpenRouter
     result = vantage.run(vcfg, v, data, echo=lambda s: None)
     assert sorted(calls) == ["groq", "openai"]
     assert "gemini: odd EAT hours only" in result["notes"]
     calls.clear()
-    _at(monkeypatch, 20, 20)  # 23:20 EAT, a late start of the 22:45 slot: nothing is due
+    _at(monkeypatch, 19, 56)  # 22:56 EAT: the same hour, so the calls are already done
     result = vantage.run(vcfg, v, data, echo=lambda s: None)
     assert calls == []
-    assert any(n.startswith("groq: not due") for n in result["notes"])
-    _at(monkeypatch, 20, 50)  # 23:50 EAT: an odd hour, and an hour after the last calls
+    assert any(n.startswith("groq: already called this hour") for n in result["notes"])
+    _at(monkeypatch, 20, 16)  # 23:16 EAT: before :30, probes only
+    result = vantage.run(vcfg, v, data, echo=lambda s: None)
+    assert calls == [] and result["notes"] == ["all: probes only before :30 EAT"]
+    assert len(_rows(result["file"], "SELECT * FROM probes")) == 9
+    assert _rows(result["file"], "SELECT ai_hour_eat, ai_run_id FROM vantage_context") == [
+        {"ai_hour_eat": None, "ai_run_id": None}
+    ]
+    _at(monkeypatch, 20, 31)  # 23:31 EAT: a new, odd hour, 41 min after the last calls
     vantage.run(vcfg, v, data, echo=lambda s: None)
     assert sorted(calls) == ["gemini", "groq", "openai", "openrouter"]
+    assert len(list((data / "runs").glob("*/*.sqlite3"))) == 4
 
 
 def test_no_paid_call_without_the_ledger_or_past_the_cap(runner, monkeypatch):
@@ -222,7 +235,23 @@ def test_pull_imports_into_its_own_labelled_database_once(runner, monkeypatch, t
     assert [r["vantage"] for r in _rows(dest, "SELECT * FROM ai_spend")] == ["us-runner"]
     assert _rows(dest, "SELECT runner_ip FROM vantage_context") == [{"runner_ip": RUNNER_IP}]
     assert vantage.pull(vcfg, v, echo=out.append) == {"new": 0, "files": 1, "spend_rows": 0}
+    assert _rows(dest, "SELECT ai_hour_eat FROM vantage_context") == [{"ai_hour_eat": 21}]
     assert not vcfg.db_path.exists()  # nothing went near the Kenya database
     kenya = dataclasses.replace(v, db_path=vcfg.db_path)
     with pytest.raises(vantage.VantageError, match="Kenya database"):
         vantage.pull(vcfg, kenya)
+
+
+def test_vantage_db_from_before_the_new_columns_gets_them(tmp_path):
+    path = tmp_path / "vantage.sqlite3"
+    conn = sqlite3.connect(path)
+    # The table as the first runs made it: everything before ai_hour_eat.
+    first = vantage.CONTEXT_TABLE.split("    ai_hour_eat")[0]
+    old = first.replace("ai_notes TEXT,", "ai_notes TEXT")
+    conn.execute(f"CREATE TABLE vantage_context ({old}\n, source_file TEXT)")
+    conn.commit()
+    conn.close()
+    conn = vantage.connect_vantage_db(path)
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(vantage_context)")}
+    conn.close()
+    assert {"slot_hour_eat", "ai_hour_eat", "gh_schedule", "source_file"} <= columns
